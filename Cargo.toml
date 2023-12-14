@@ -1,0 +1,7 @@
+[workspace]
+
+members = [
+    "odoo-core",
+    "odoo-app",
+]
+
