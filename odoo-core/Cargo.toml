@@ -1,0 +1,14 @@
+[package]
+name = "odoo-core"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dashmap = "5.5.3"
+xxhash-rust = {version = "0.8.7", features = ["xxh3", "const_xxh3"]}
+crossbeam = "0.8.2"
+chrono = "0.4.31"
+log = { version = "0.4.20", features = [] }
+uuid = {version = "1.6.1", features = ["default", "v7", "serde"]}
