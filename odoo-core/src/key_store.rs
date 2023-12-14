@@ -1,16 +1,19 @@
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossbeam::channel;
 use crossbeam::channel::SendError;
 use dashmap::DashMap;
 use log::error;
+use crate::helpers::hash_key_to_unsigned_int;
 
 #[derive(Debug, Clone)]
 pub struct StoreItem {
     timestamp: chrono::DateTime<chrono::Utc>,
     value: Vec<u8>,
     expire_at: Option<chrono::DateTime<chrono::Utc>>,
+    key: String
 }
 
 #[derive(Debug, Clone)]
@@ -19,6 +22,18 @@ pub enum StoreValue {
     Stream,
 }
 
+impl StoreValue {
+    pub fn get_key(&self) -> String {
+        match self {
+            StoreValue::Item(store_value) => {
+                return store_value.key.clone();
+            }
+            _ => {"".to_string()}
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct KeyStore {
     store: DashMap<u64, Arc<StoreValue>>,
     notify: DashMap<String, channel::Sender<Arc<KeyStoreEvent>>>,
@@ -43,20 +58,36 @@ impl KeyStore {
         }
     }
 
-    pub fn add_key(&self, key: u64, value: Vec<u8>) {
+    pub fn add_key(&self, key: &str, value: Vec<u8>, duration: Option<Duration>) {
         let item = Arc::new(StoreValue::Item(
             StoreItem {
                 expire_at: None,
                 timestamp: chrono::Utc::now(),
                 value,
+                key: key.to_string()
             }
         ));
-        self.store.insert(key, item.clone());
-        self.notify_listeners(KeyStoreEvent::KeyAdded(item));
+        let store_key = hash_key_to_unsigned_int(key.as_bytes());
+        self.store.insert(store_key, item.clone());
+        KeyStore::notify_listeners(self.notify.clone(), KeyStoreEvent::KeyAdded(item));
+        match duration {
+            Some(timeout) => {
+                let async_store = self.store.clone();
+                let async_listeners = self.notify.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(timeout).await;
+                    if let Some((key, value)) = async_store.remove(&store_key) {
+                        KeyStore::notify_listeners(async_listeners, KeyStoreEvent::KeyDeleted(value));
+                    }
+                });
+            }
+            _ => {}
+        }
+
     }
 
-    pub fn get_key(&self, key: u64) -> Option<StoreItem> {
-        if let Some(value) = self.store.get(&key) {
+    pub fn get_key(&self, key: &str) -> Option<StoreItem> {
+        if let Some(value) = self.store.get(&hash_key_to_unsigned_int(key.as_bytes())) {
             let stored_value = value.value().clone().as_ref().clone();
             if let StoreValue::Item(item) = stored_value {
                 return Some(item.clone());
@@ -65,25 +96,24 @@ impl KeyStore {
         None
     }
 
-    pub fn delete_key(&self, key: u64) -> bool {
-        self.store.remove(&key).is_some()
+    pub fn delete_key(&self, key: &str) -> bool {
+        self.store.remove(&hash_key_to_unsigned_int(key.as_bytes())).is_some()
     }
 
     pub fn register_listener(&self, listener_name: String, tx: channel::Sender<Arc<KeyStoreEvent>>) {
         self.notify.insert(listener_name, tx);
     }
 
-    fn notify_listeners(&self, value: KeyStoreEvent) -> Result<(), KeyStoreError> {
+    fn notify_listeners(notify: DashMap<String, channel::Sender<Arc<KeyStoreEvent>>>, value: KeyStoreEvent) -> () {
         let value = Arc::new(value);
-        self.notify.iter().for_each(|notifier| {
+        notify.iter().for_each(|notifier| {
             if let Err(notification_error) =  notifier.send(value.clone()) {
                 if let SendError(_) = notification_error {
                     error!("Error sending notification to {} listener. EX: {:?}",  notifier.key().as_str(), notification_error);
-                    self.notify.remove(notifier.key().as_str());
+                    notify.remove(notifier.key().as_str());
                 }
             }
         });
-        Ok(())
     }
 }
 
@@ -103,7 +133,7 @@ mod tests {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(5));
                 for j in 0..200000 {
-                    store.add_key(j * thread_id, format!("{}-{}", thread_id, j).as_bytes().to_vec());
+                    store.add_key((j * thread_id).to_string().as_str(), format!("{}-{}", thread_id, j).as_bytes().to_vec(), None);
                 }
             });
         }
@@ -116,7 +146,7 @@ mod tests {
 
         store.register_listener("test_listener".to_string(), tx);
         std::thread::spawn(move || {
-            store.add_key(10, format!("{}-{}", 19, "test").as_bytes().to_vec());
+            store.add_key(10.to_string().as_str(), format!("{}-{}", 19, "test").as_bytes().to_vec(), None);
         });
 
         std::thread::sleep(Duration::from_secs(5));

@@ -12,3 +12,4 @@ crossbeam = "0.8.2"
 chrono = "0.4.31"
 log = { version = "0.4.20", features = [] }
 uuid = {version = "1.6.1", features = ["default", "v7", "serde"]}
+tokio = { version = "1.35.0", features = ["default", "rt", "sync", "fs", "time"] }
