@@ -1,6 +1,6 @@
 pub mod key_store;
-mod helpers;
-mod key_listeners;
+pub mod helpers;
+pub mod key_listeners;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right

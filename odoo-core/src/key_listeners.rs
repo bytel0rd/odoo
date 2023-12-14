@@ -1,51 +1,31 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
 
 use crossbeam::channel;
+use log::error;
 use uuid::Uuid;
 
 use crate::helpers::hash_key_to_unsigned_int;
+use crate::key_store::{KeyStoreEvent, StoreValue};
 
 #[derive(Debug, Clone)]
-pub struct StoreItem {
-    timestamp: chrono::DateTime<chrono::Utc>,
-    value: Vec<u8>,
-    expire_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-#[derive(Debug, Clone)]
-pub enum StoreValue {
-    Item(StoreItem),
-    Stream,
-}
-
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct EventKey(u64);
-
-#[derive(Debug, Clone)]
-pub struct EventListenerIndex(Vec<u64>);
-
-
 pub enum ListenerHubError {
     RegisterError(String),
-    KeyNotFound,
+    EventRegisterError(String),
+    NotificationError(String),
     KeyExpired,
 }
 
 pub struct ListenerHub {
     /// This is a map of listeners that are interested in a particular key.
-    listeners_map: Arc<RwLock<BTreeMap<u64, channel::Sender<Arc<KeyStoreEvent>>>>>,
+    listeners_map: Arc<RwLock<BTreeMap<u64, channel::Sender<Arc<StoreValue>>>>>,
 
     /// This is a map of the index of listeners that are interested in a particular event .
-    event_indexes: Arc<RwLock<BTreeMap<u64, Vec<u64>>>>,
-}
+    event_indexes: Arc<RwLock<BTreeMap<u64, BTreeSet<u64>>>>,
 
-#[derive(Debug, Clone)]
-pub enum KeyStoreEvent {
-    KeyAdded(Arc<StoreValue>),
-    KeyDeleted(Arc<StoreValue>),
+    /// close all connections
+    close_connections: bool,
 }
 
 impl ListenerHub {
@@ -53,38 +33,189 @@ impl ListenerHub {
         ListenerHub {
             listeners_map: Arc::new(RwLock::new(BTreeMap::new())),
             event_indexes: Arc::new(RwLock::new(BTreeMap::new())),
+            close_connections: false,
         }
     }
 
-    pub fn register_listener(&self, tx: channel::Sender<Arc<KeyStoreEvent>>) -> Result<Uuid, ListenerHubError> {
+    pub fn register_listener(&self, tx: channel::Sender<Arc<StoreValue>>) -> Result<Uuid, ListenerHubError> {
         let uuid = Uuid::now_v7();
         match self.listeners_map.write() {
             Ok(mut store) => {
                 let key = hash_key_to_unsigned_int(uuid.as_bytes());
                 store.insert(key, tx);
             }
-            Err(_) => {}
+            Err(err) => {
+                error!("Error registering listener {:?}", &err);
+            }
         }
         Ok(uuid)
     }
 
-    pub fn unregister_listener(&self, key: Uuid) -> bool {
-        self.listeners_map.remove(&key).is_some()
+    pub fn unregister_listener(&self, key: &Uuid) -> bool {
+        match self.listeners_map.write() {
+            Ok(mut store) => {
+                let listener_key = hash_key_to_unsigned_int(key.as_bytes());
+                let is_removed = store.remove(&listener_key).is_some();
+                if is_removed {
+                    let events = self.event_indexes.clone();
+                    let key = key.clone();
+                    tokio::spawn(async move {
+                        match ListenerHub::_unregister_all_events(events, &key) {
+                            Ok(_) => {}
+                            Err(err) => {
+                                error!("Error registering listener events {:?}", &err);
+                            }
+                        }
+                    });
+                }
+                return is_removed;
+            }
+            Err(err) => {
+                error!("Error registering listener {:?}", &err);
+            }
+        }
+        false
+    }
+
+    pub fn register_event(&self, key: &Uuid, event_key: u64) -> Result<(), ListenerHubError> {
+        let listener_key = hash_key_to_unsigned_int(key.as_bytes());
+        match self.event_indexes.write() {
+            Ok(mut event) => {
+                if event.contains_key(&event_key) {
+                    event.get_mut(&event_key).unwrap().insert(listener_key);
+                } else {
+                    let mut events = BTreeSet::new();
+                    events.insert(listener_key);
+                    event.insert(event_key, events);
+                }
+            }
+            Err(err) => {
+                error!("Error registering channel on the event listener {:?}", &err);
+                return Err(ListenerHubError::EventRegisterError("Error registering key for channel".to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn unregister_event(&self, key: &Uuid, event_key: u64) -> Result<(), ListenerHubError> {
+        let listener_key = hash_key_to_unsigned_int(key.as_bytes());
+        match self.event_indexes.write() {
+            Ok(mut event) => {
+                if event.contains_key(&event_key) {
+                    event.get_mut(&event_key).unwrap().remove(&listener_key);
+                }
+            }
+            Err(err) => {
+                error!("Error unregistering channel on the event listener {:?}", &err);
+                return Err(ListenerHubError::EventRegisterError("Error unregistering key for channel".to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn unregister_all_events(&self, key: &Uuid) -> Result<(), ListenerHubError> {
+        ListenerHub::_unregister_all_events(self.event_indexes.clone(), key)
+    }
+
+    fn _unregister_all_events(event_indexes: Arc<RwLock<BTreeMap<u64, BTreeSet<u64>>>>, key: &Uuid) -> Result<(), ListenerHubError> {
+        let listener_key = hash_key_to_unsigned_int(key.as_bytes());
+        match event_indexes.write() {
+            Ok(mut event) => {
+                event.values_mut().for_each(|v| {
+                    v.remove(&listener_key);
+                });
+            }
+            Err(err) => {
+                error!("Error unregistering channel on the all event listener {:?}", &err);
+                return Err(ListenerHubError::EventRegisterError("Error unregistering key for all events channel".to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn notify(&self, event: Arc<KeyStoreEvent>) -> Result<(), ListenerHubError> {
+       ListenerHub::_send_to_listeners(self.listeners_map.clone(), self.event_indexes.clone(), event)
+    }
+
+    fn _send_to_listeners(listeners_map: Arc<RwLock<BTreeMap<u64, channel::Sender<Arc<StoreValue>>>>>,
+                          event_indexes: Arc<RwLock<BTreeMap<u64, BTreeSet<u64>>>>,
+                          event: Arc<KeyStoreEvent>) -> Result<(), ListenerHubError> {
+        return match event.clone().as_ref().clone() {
+            KeyStoreEvent::KeyAdded(store_value) => {
+                ListenerHub::_notify_listeners(listeners_map, event_indexes, store_value)
+            }
+            _ => {
+                Ok(())
+            }
+        };
     }
 
 
-    // fn notify_listeners(&self, value: KeyStoreEvent) -> Result<(), KeyStoreError> {
-    //     let value = Arc::new(value);
-    //     self.notify.iter().for_each(|notifier| {
-    //         if let Err(notification_error) = notifier.send(value.clone()) {
-    //             if let SendError(_) = notification_error {
-    //                 error!("Error sending notification to {} listener. EX: {:?}",  notifier.key().as_str(), notification_error);
-    //                 self.notify.remove(notifier.key().as_str());
-    //             }
-    //         }
-    //     });
-    //     Ok(())
-    // }
+    fn _notify_listeners(listeners_map: Arc<RwLock<BTreeMap<u64, channel::Sender<Arc<StoreValue>>>>>,
+                         event_indexes: Arc<RwLock<BTreeMap<u64, BTreeSet<u64>>>>,
+                         event: Arc<StoreValue>) -> Result<(), ListenerHubError> {
+        let selected_listeners = ListenerHub::_select_listeners(event_indexes.clone(), event.clone())?;
+        let listeners_to_remove = Arc::new(RwLock::new(BTreeSet::new()));
+
+        {
+            match listeners_map.read() {
+                Ok(listener_store) => {
+                    // potential optimization...parallelize or async the listeners
+                    for listener_index in &selected_listeners {
+                        let listeners_to_remove = listeners_to_remove.clone();
+                        if let Some(channel) = listener_store.get(listener_index) {
+                            match channel.send(event.clone()) {
+                                Err(err) => {
+                                    error!("Unable to send to listeners channel: {:?}", err);
+                                    ListenerHub::_update_listener_to_remove(listeners_to_remove, listener_index.clone());
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            ListenerHub::_update_listener_to_remove(listeners_to_remove, listener_index.clone());
+                        }
+                    }
+                }
+                Err(err) => {
+                    error!("Failed to read listeners: {:?}", err);
+                    return Err(ListenerHubError::NotificationError("Unable to read listeners".to_string()));
+                }
+            }
+        }
+
+
+        Ok(())
+    }
+
+    fn _select_listeners(event_indexes: Arc<RwLock<BTreeMap<u64, BTreeSet<u64>>>>, event: Arc<StoreValue>) -> Result<BTreeSet<u64>, ListenerHubError> {
+        let event_key = hash_key_to_unsigned_int(event.as_ref().get_key().as_bytes());
+        return match event_indexes.read() {
+            Ok(index) => {
+                Ok(match index.get(&event_key) {
+                    None => BTreeSet::new(),
+                    Some(listeners) => listeners.clone()
+                })
+            }
+            Err(err) => {
+                error!("Error notifying all listening channels {:?}", &err);
+                Err(ListenerHubError::EventRegisterError("Error notifying all listening channels".to_string()))
+            }
+        };
+    }
+
+    fn _update_listener_to_remove(listeners_to_remove: Arc<RwLock<BTreeSet<u64>>>, index_to_remove: u64) {
+        match listeners_to_remove.write() {
+            Ok(mut listener) => {
+                listener.insert(index_to_remove);
+            }
+            Err(err) => {
+                error!("Unable mark channel for removals {:?}", &err);
+            }
+        }
+    }
 }
 
 
