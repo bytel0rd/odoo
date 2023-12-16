@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
 
 use crossbeam::channel;
-use log::error;
+use log::{debug, error};
 use uuid::Uuid;
 
 use crate::helpers::hash_key_to_unsigned_int;
@@ -158,6 +158,7 @@ impl ListenerHub {
                          event_indexes: Arc<RwLock<BTreeMap<u64, BTreeSet<u64>>>>,
                          event: Arc<StoreValue>) -> Result<(), ListenerHubError> {
         let selected_listeners = ListenerHub::_select_listeners(event_indexes.clone(), event.clone())?;
+        debug!("notifying listeners");
         let listeners_to_remove = Arc::new(RwLock::new(BTreeSet::new()));
 
         {
@@ -191,6 +192,7 @@ impl ListenerHub {
     }
 
     fn _select_listeners(event_indexes: Arc<RwLock<BTreeMap<u64, BTreeSet<u64>>>>, event: Arc<StoreValue>) -> Result<BTreeSet<u64>, ListenerHubError> {
+        debug!("selecting listeners");
         let event_key = hash_key_to_unsigned_int(event.as_ref().get_key().as_bytes());
         return match event_indexes.read() {
             Ok(index) => {
