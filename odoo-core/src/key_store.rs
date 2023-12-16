@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use std::ops::AddAssign;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LockResult, RwLock};
 use std::time::Duration;
 
 use crossbeam::channel;
@@ -12,10 +12,10 @@ use crate::helpers::hash_key_to_unsigned_int;
 
 #[derive(Debug, Clone)]
 pub struct StoreItem {
-    timestamp: chrono::DateTime<chrono::Utc>,
-    value: Vec<u8>,
-    expire_at: Option<chrono::DateTime<chrono::Utc>>,
-    key: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub value: Vec<u8>,
+    pub expire_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -28,46 +28,58 @@ pub struct StoreStream {
 
 #[derive(Debug, Clone)]
 pub enum StoreValue {
-    Item(StoreItem),
+    Item(Arc<RwLock<StoreItem>>),
     Stream(Arc<RwLock<StoreStream>>),
 }
 
 impl StoreValue {
-    pub fn get_key(&self) -> String {
+    pub fn get_key(&self) -> Result<String, KeyStoreError> {
         return match self {
             StoreValue::Item(store_value) => {
-                store_value.key.clone()
+                match store_value.read() {
+                    Ok(value) => Ok(value.key.clone()),
+                    Err(err) => {
+                        error!("Error getting lock to read store item key: {:?}", err);
+                        Err(KeyStoreError::UnableToFetchKey)
+                    }
+                }
             }
             StoreValue::Stream(stream) => {
                 match stream.read() {
-                    Ok(stream) => stream.key.clone(),
+                    Ok(stream) => Ok(stream.key.clone()),
                     Err(err) => {
                         error!("Error getting lock to read stream key: {:?}", err);
-                        "".to_string()
+                        Err(KeyStoreError::UnableToFetchKey)
                     }
                 }
             }
         };
     }
 
-    pub fn get_hash_key(&self) -> String {
+    pub fn get_hash_key(&self) -> Result<String, KeyStoreError> {
         return match self {
-            StoreValue::Item(store_value) => {
-                store_value.key.clone()
+            StoreValue::Item(store_item) => {
+                return match store_item.read() {
+                    Ok(value) => Ok(value.key.clone()),
+                    Err(err) => {
+                        error!("Error getting lock to read store item hash key: {:?}", err);
+                        Err(KeyStoreError::UnableToFetchKey)
+                    }
+                };
             }
             StoreValue::Stream(stream) => {
                 match stream.read() {
                     Ok(stream) => {
                         if stream.value.is_empty() {
-                            stream.key.clone()
+                            Ok(stream.key.clone())
                         } else {
                             let (key, _) = stream.value.last().unwrap();
-                            format!("{}-{}", stream.key.clone(), key)
+                            Ok(format!("{}-{}", stream.key.clone(), key))
                         }
                     }
                     Err(err) => {
                         error!("Error getting lock to read stream hash key: {:?}", err);
-                        "".to_string()
+                        Err(KeyStoreError::UnableToFetchKey)
                     }
                 }
             }
@@ -81,16 +93,19 @@ pub struct KeyStore {
     notify: DashMap<String, channel::Sender<Arc<KeyStoreEvent>>>,
 }
 
+#[derive(Debug)]
 pub enum KeyStoreError {
     KeyNotFound,
     KeyExpired,
+    UnableToFetchKey,
+    GeneralError(Box<dyn std::error::Error>),
 }
 
 #[derive(Debug, Clone)]
 pub enum KeyStoreEvent {
-    KeyAdded(Arc<StoreValue>),
+    KeyAdded(Arc<StoreItem>),
     KeyDeleted(Arc<StoreValue>),
-    StreamUpdate(Arc<StoreValue>),
+    StreamUpdate(Arc<StoreItem>),
 }
 
 impl KeyStore {
@@ -102,20 +117,24 @@ impl KeyStore {
     }
 
     pub fn add_key(&self, key: &str, value: Vec<u8>, duration: Option<Duration>) {
+        let store_item = StoreItem {
+            expire_at: None,
+            timestamp: chrono::Utc::now(),
+            value,
+            key: key.to_string(),
+        };
         let item = Arc::new(StoreValue::Item(
-            StoreItem {
-                expire_at: None,
-                timestamp: chrono::Utc::now(),
-                value,
-                key: key.to_string(),
-            }
+            Arc::new(RwLock::new(store_item.clone()))
         ));
         let store_key = hash_key_to_unsigned_int(key.as_bytes());
         self.store.insert(store_key, item.clone());
-        KeyStore::notify_listeners(self.notify.clone(), KeyStoreEvent::KeyAdded(item.clone()));
+        let store_item = Arc::new(store_item);
+        KeyStore::notify_listeners(self.notify.clone(), KeyStoreEvent::KeyAdded(store_item.clone()));
         match duration {
             Some(timeout) => {
-                KeyStore::schedule_key_clearing(self.store.clone(), self.notify.clone(), item.clone(), timeout);
+                if let Err(err) = KeyStore::schedule_key_clearing(self.store.clone(), self.notify.clone(), store_item.clone(), timeout) {
+                    error!("Error scheduling clearing store item key: {} Ex: {:?}", key, err);
+                }
             }
             _ => {}
         }
@@ -125,7 +144,12 @@ impl KeyStore {
         if let Some(value) = self.store.get(&hash_key_to_unsigned_int(key.as_bytes())) {
             let stored_value = value.value().clone().as_ref().clone();
             if let StoreValue::Item(item) = stored_value {
-                return Some(item.clone());
+                match item.read() {
+                    Ok(value) => {
+                        return Some(value.clone());
+                    }
+                    Err(_) => {}
+                }
             }
         }
         None
@@ -197,17 +221,19 @@ impl KeyStore {
             }
         }
 
-        let stream_update = Arc::new(StoreValue::Item(StoreItem {
+        let stream_update = Arc::new(StoreItem {
             timestamp: time,
             value,
             expire_at,
             key: key.to_string(),
-        }));
+        });
 
         KeyStore::notify_listeners(self.notify.clone(), KeyStoreEvent::StreamUpdate(stream_update.clone()));
         match duration {
             Some(timeout) => {
-                KeyStore::schedule_key_clearing(self.store.clone(), self.notify.clone(), stream_update.clone(), timeout);
+                if let Err(err) = KeyStore::schedule_key_clearing(self.store.clone(), self.notify.clone(), stream_update.clone(), timeout) {
+                    error!("Error scheduling clearing stream key: {} Ex: {:?}", key, err);
+                }
             }
             _ => {}
         }
@@ -242,23 +268,32 @@ impl KeyStore {
 
     fn schedule_key_clearing(store: DashMap<u64, Arc<StoreValue>>,
                              notify: DashMap<String, channel::Sender<Arc<KeyStoreEvent>>>,
-                             item: Arc<StoreValue>,
-                             timeout: Duration) {
-        let store_key = hash_key_to_unsigned_int(item.get_key().as_bytes());
-        let idempotency_key = item.clone().get_hash_key();
+                             item: Arc<StoreItem>,
+                             timeout: Duration) -> Result<(), KeyStoreError> {
+        let item_ref = item.as_ref();
+        let store_key = hash_key_to_unsigned_int(item.key.as_bytes());
+        let idempotency_key = item_ref.key.clone();
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
             if let Some(item) = store.get(&store_key) {
-                if idempotency_key.eq(item.get_hash_key().as_str()) {
+                let hash_key_result = item.get_hash_key();
+                if hash_key_result.is_err() {
+                    error!("Error clearing scheduled key: {} Ex: {:?}", idempotency_key, hash_key_result.unwrap_err());
+                    return;
+                }
+                let hash_key = hash_key_result.unwrap();
+                if idempotency_key.eq(hash_key.as_str()) {
                     if let Some((_, value)) = store.remove(&store_key) {
                         KeyStore::notify_listeners(notify, KeyStoreEvent::KeyDeleted(value));
                         debug!("Deleted key hash_key: {}", idempotency_key);
                     }
                 } else {
-                    debug!("Clearing scheduled skipped, hash not a match. expected_hash_key: {} hash_key: {}", idempotency_key, item.get_hash_key());
+                    debug!("Clearing scheduled skipped, hash not a match. expected_hash_key: {} hash_key: {}", idempotency_key, hash_key);
                 }
             }
         });
+
+        Ok(())
     }
 }
 
