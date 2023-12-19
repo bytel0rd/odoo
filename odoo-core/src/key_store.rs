@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use std::ops::AddAssign;
-use std::sync::{Arc, LockResult, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crossbeam::channel;
@@ -93,11 +93,15 @@ pub struct KeyStore {
     notify: DashMap<String, channel::Sender<Arc<KeyStoreEvent>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum KeyStoreError {
+    #[error("Key not found")]
     KeyNotFound,
+    #[error("Expired key")]
     KeyExpired,
+    #[error("Unable to fetch key")]
     UnableToFetchKey,
+    #[error("Store Error: Ex: {0:?}")]
     GeneralError(Box<dyn std::error::Error>),
 }
 
@@ -239,14 +243,14 @@ impl KeyStore {
         }
     }
 
-    pub fn resume_stream_for_key(&self, key: &str, last_timestamp: i64, limit: Option<i64>) -> Vec<StoreItem> {
+    pub fn resume_stream_for_key(&self, key: &str, last_timestamp: Option<i64>, limit: Option<i64>) -> (i64, Vec<StoreItem>) {
         let mut pending_streams = vec![];
         if let Some(value) = self.store.get(&hash_key_to_unsigned_int(key.as_bytes())) {
             let stored_value = value.value().as_ref();
             if let StoreValue::Stream(item) = stored_value {
                 if let Ok(store) = item.read() {
                     for (key, value) in store.value.iter().rev() {
-                        if key.clone() > last_timestamp {
+                        if last_timestamp.map(|v| key.clone() > v).unwrap_or(true) {
                             let stream_update = StoreItem {
                                 timestamp: store.timestamp.clone(),
                                 value: value.clone(),
@@ -254,16 +258,27 @@ impl KeyStore {
                                 key: key.to_string(),
                             };
                             pending_streams.push(stream_update);
-                            if limit.map(|v| v == pending_streams.len() as i64).unwrap_or(false) {
-                                break;
-                            }
                         }
                     }
                 }
             }
         }
-        let reversed = pending_streams.iter();
-        reversed.rev().map(|f| f.to_owned()).collect::<Vec<StoreItem>>()
+
+        let total = pending_streams.len();
+        let stream_updates = {
+            let reversed = pending_streams.iter();
+            let mut reversed = reversed.rev();
+            if limit.is_some() {
+                reversed.take(limit.unwrap() as usize)
+                    .map(|f| f.to_owned())
+                    .collect::<Vec<StoreItem>>()
+            } else {
+                reversed
+                    .map(|f| f.to_owned())
+                    .collect::<Vec<StoreItem>>()
+            }
+        };
+        (total as i64, stream_updates)
     }
 
     fn schedule_key_clearing(store: DashMap<u64, Arc<StoreValue>>,

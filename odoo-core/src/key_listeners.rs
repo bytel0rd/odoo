@@ -1,25 +1,32 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LockResult, RwLock};
 
-use crossbeam::channel;
-use log::{debug, error};
+use log::{debug, error, trace};
+use tokio::sync;
 use uuid::Uuid;
 
 use crate::helpers::hash_key_to_unsigned_int;
 use crate::key_store::{KeyStoreEvent, StoreItem, StoreValue};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ListenerHubError {
+    #[error("Unable to register listener. {0}")]
     RegisterError(String),
+    #[error("Unable to register event for listener. {0}")]
     EventRegisterError(String),
+    #[error("Unable to notify listener. {0}")]
     NotificationError(String),
+    #[error("Key expired")]
     KeyExpired,
+    #[error("Stream replay failed")]
+    ReplyFailedError,
 }
 
+pub type Listener = sync::broadcast::Sender<Arc<Option<StoreItem>>>;
 pub struct ListenerHub {
     /// This is a map of listeners that are interested in a particular key.
-    listeners_map: Arc<RwLock<BTreeMap<u64, channel::Sender<Arc<StoreItem>>>>>,
+    listeners_map: Arc<RwLock<BTreeMap<u64, Listener>>>,
 
     /// This is a map of the index of listeners that are interested in a particular event .
     event_indexes: Arc<RwLock<BTreeMap<u64, BTreeSet<u64>>>>,
@@ -37,7 +44,7 @@ impl ListenerHub {
         }
     }
 
-    pub fn register_listener(&self, tx: channel::Sender<Arc<StoreItem>>) -> Result<Uuid, ListenerHubError> {
+    pub fn register_listener(&self, tx: Listener) -> Result<Uuid, ListenerHubError> {
         let uuid = Uuid::now_v7();
         match self.listeners_map.write() {
             Ok(mut store) => {
@@ -140,7 +147,7 @@ impl ListenerHub {
        ListenerHub::_send_to_listeners(self.listeners_map.clone(), self.event_indexes.clone(), event)
     }
 
-    fn _send_to_listeners(listeners_map: Arc<RwLock<BTreeMap<u64, channel::Sender<Arc<StoreItem>>>>>,
+    fn _send_to_listeners(listeners_map: Arc<RwLock<BTreeMap<u64, Listener>>>,
                           event_indexes: Arc<RwLock<BTreeMap<u64, BTreeSet<u64>>>>,
                           event: Arc<KeyStoreEvent>) -> Result<(), ListenerHubError> {
         return match event.clone().as_ref().clone() {
@@ -154,7 +161,7 @@ impl ListenerHub {
     }
 
 
-    fn _notify_listeners(listeners_map: Arc<RwLock<BTreeMap<u64, channel::Sender<Arc<StoreItem>>>>>,
+    fn _notify_listeners(listeners_map: Arc<RwLock<BTreeMap<u64, Listener>>>,
                          event_indexes: Arc<RwLock<BTreeMap<u64, BTreeSet<u64>>>>,
                          event: Arc<StoreItem>) -> Result<(), ListenerHubError> {
         let selected_listeners = ListenerHub::_select_listeners(event_indexes.clone(), event.clone())?;
@@ -168,7 +175,7 @@ impl ListenerHub {
                     for listener_index in &selected_listeners {
                         let listeners_to_remove = listeners_to_remove.clone();
                         if let Some(channel) = listener_store.get(listener_index) {
-                            match channel.send(event.clone()) {
+                            match channel.send(Arc::new(Some(event.clone().as_ref().clone()))) {
                                 Err(err) => {
                                     error!("Unable to send to listeners channel: {:?}", err);
                                     ListenerHub::_update_listener_to_remove(listeners_to_remove, listener_index.clone());
@@ -187,6 +194,15 @@ impl ListenerHub {
             }
         }
 
+        if let Ok(mut map) = listeners_map.write() {
+            if let Ok(removals) = listeners_to_remove.read() {
+                for l in removals.iter() {
+                    if let None = map.remove(l) {
+                        trace!("Listener not present: {}", l);
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
