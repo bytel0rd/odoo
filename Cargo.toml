@@ -3,5 +3,7 @@
 members = [
     "odoo-core",
     "odoo-app",
+    "odoo-server",
+    "odoo-client",
 ]
 

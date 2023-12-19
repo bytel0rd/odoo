@@ -5,6 +5,8 @@
       <sourceFolder url="file://$MODULE_DIR$/odoo-core/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/odoo-app/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/odoo-client/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/odoo-server/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/odoo-core/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
