@@ -1,5 +1,5 @@
 [package]
-name = "odoo-app"
+name = "odoo-client"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,8 +7,11 @@ edition = "2021"
 
 [dependencies]
 odoo-core = { path = "../odoo-core" }
-odoo-client = { path = "../odoo-client" }
+dashmap = "5.5.3"
+xxhash-rust = {version = "0.8.7", features = ["xxh3", "const_xxh3"]}
 chrono = "0.4.31"
 tokio = {version = "1.35.0", features = ["default", "macros", "sync", "rt", "rt-multi-thread", "net", "io-std", "io-util" ]}
+crossbeam = "0.8.2"
 pretty_env_logger="0.5.0"
 log = "0.4.20"
+bytes = { version = "1.5.0", features = ["serde"] }
