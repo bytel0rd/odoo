@@ -30,6 +30,7 @@ pub struct Message {
     pub r#type: MessageType,
     pub data: Vec<Vec<u8>>,
     pub timestamp: Option<i64>,
+    pub id: Option<uuid::Uuid>
 }
 
 impl MessageEncoder {

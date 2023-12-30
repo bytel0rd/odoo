@@ -191,6 +191,29 @@ impl KeyStore {
             return time;
         });
 
+        let stream_update = Arc::new(StoreItem {
+            timestamp: time,
+            value: value.clone(),
+            expire_at,
+            key: key.to_string(),
+        });
+
+        let n = self.notify.clone();
+        let s = self.store.clone();
+        let u = stream_update.clone();
+        tokio::spawn(async move {
+            let k = KeyStoreEvent::StreamUpdate(u.clone());
+            KeyStore::notify_listeners(n.clone(), k.clone());
+            match duration {
+                Some(timeout) => {
+                    if let Err(err) = KeyStore::schedule_key_clearing(s.clone(), n.clone(), u.clone(), timeout) {
+                        error!("Error scheduling clearing stream key: {} Ex: {:?}", u.key, err);
+                    }
+                }
+                _ => {}
+            }
+        });
+
         {
             let mut stream = Arc::new(StoreValue::Stream(
                 Arc::new(RwLock::new(StoreStream {
@@ -225,25 +248,25 @@ impl KeyStore {
             }
         }
 
-        let stream_update = Arc::new(StoreItem {
-            timestamp: time,
-            value,
-            expire_at,
-            key: key.to_string(),
-        });
 
-        KeyStore::notify_listeners(self.notify.clone(), KeyStoreEvent::StreamUpdate(stream_update.clone()));
-        match duration {
-            Some(timeout) => {
-                if let Err(err) = KeyStore::schedule_key_clearing(self.store.clone(), self.notify.clone(), stream_update.clone(), timeout) {
-                    error!("Error scheduling clearing stream key: {} Ex: {:?}", key, err);
+        let n = self.notify.clone();
+        let s = self.store.clone();
+        let u = stream_update.clone();
+        tokio::spawn(async move {
+            let k = KeyStoreEvent::StreamUpdate(u.clone());
+            KeyStore::notify_listeners(n.clone(), k.clone());
+            match duration {
+                Some(timeout) => {
+                    if let Err(err) = KeyStore::schedule_key_clearing(s.clone(), n.clone(), u.clone(), timeout) {
+                        error!("Error scheduling clearing stream key: {} Ex: {:?}", u.key, err);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
-        }
+        });
     }
 
-    pub fn resume_stream_for_key(&self, key: &str, last_timestamp: Option<i64>, limit: Option<i64>) -> (i64, Vec<StoreItem>) {
+    pub fn resume_stream_for_key(&self, key: &str, last_timestamp: Option<i64>) -> Vec<StoreItem> {
         let mut pending_streams = vec![];
         if let Some(value) = self.store.get(&hash_key_to_unsigned_int(key.as_bytes())) {
             let stored_value = value.value().as_ref();
@@ -264,21 +287,10 @@ impl KeyStore {
             }
         }
 
-        let total = pending_streams.len();
-        let stream_updates = {
-            let reversed = pending_streams.iter();
-            let mut reversed = reversed.rev();
-            if limit.is_some() {
-                reversed.take(limit.unwrap() as usize)
-                    .map(|f| f.to_owned())
-                    .collect::<Vec<StoreItem>>()
-            } else {
-                reversed
-                    .map(|f| f.to_owned())
-                    .collect::<Vec<StoreItem>>()
-            }
-        };
-        (total as i64, stream_updates)
+        let reversed = pending_streams.iter();
+        reversed.rev()
+            .map(|f| f.to_owned())
+            .collect::<Vec<StoreItem>>()
     }
 
     fn schedule_key_clearing(store: DashMap<u64, Arc<StoreValue>>,

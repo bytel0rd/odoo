@@ -153,6 +153,9 @@ impl ListenerHub {
         return match event.clone().as_ref().clone() {
             KeyStoreEvent::KeyAdded(store_value) => {
                 ListenerHub::_notify_listeners(listeners_map, event_indexes, store_value)
+            },
+            KeyStoreEvent::StreamUpdate(store_value) => {
+                ListenerHub::_notify_listeners(listeners_map, event_indexes, store_value)
             }
             _ => {
                 Ok(())
@@ -167,7 +170,6 @@ impl ListenerHub {
         let selected_listeners = ListenerHub::_select_listeners(event_indexes.clone(), event.clone())?;
         debug!("notifying listeners");
         let listeners_to_remove = Arc::new(RwLock::new(BTreeSet::new()));
-
         {
             match listeners_map.read() {
                 Ok(listener_store) => {
@@ -180,7 +182,9 @@ impl ListenerHub {
                                     error!("Unable to send to listeners channel: {:?}", err);
                                     ListenerHub::_update_listener_to_remove(listeners_to_remove, listener_index.clone());
                                 }
-                                _ => {}
+                                _ => {
+                                    trace!("sent event to listener");
+                                }
                             }
                         } else {
                             ListenerHub::_update_listener_to_remove(listeners_to_remove, listener_index.clone());
@@ -228,6 +232,7 @@ impl ListenerHub {
         match listeners_to_remove.write() {
             Ok(mut listener) => {
                 listener.insert(index_to_remove);
+                trace!("removing listeners: {}", index_to_remove);
             }
             Err(err) => {
                 error!("Unable mark channel for removals {:?}", &err);

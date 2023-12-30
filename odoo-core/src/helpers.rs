@@ -1,10 +1,16 @@
 use std::error::Error;
 use std::fmt::{Debug, Formatter, write};
 
+use futures::prelude::*;
 use log::trace;
+use serde_cbor::Value;
 use tokio::io::AsyncReadExt;
-use tokio::net::tcp::ReadHalf;
+use tokio::net::tcp::{ReadHalf, WriteHalf};
+use tokio_serde::formats::SymmetricalCbor;
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
+
+use crate::encoder::Message;
 
 pub fn hash_key_to_unsigned_int(key: &[u8]) -> u64 {
     const_xxh3(key)
@@ -23,7 +29,6 @@ pub async fn read_from_stream<'a>(r: &mut ReadHalf<'a>) -> Result<Vec<u8>, Boxed
                 n
             }
             Err(err) => {
-                dbg!(&err);
                 return Err(BoxedError::new(err));
             }
         };
@@ -55,4 +60,16 @@ impl Debug for BoxedError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write(f, format_args!("{}", self.0.as_ref().to_string()))
     }
+}
+
+
+pub async fn send_tcp_message<'a>(mut w: WriteHalf<'a>, message: Message) -> Result<(), BoxedError> {
+    let length_delimited = FramedWrite::new(w, LengthDelimitedCodec::new());
+    let mut serialized = tokio_serde::SymmetricallyFramed::new(
+        length_delimited,
+        SymmetricalCbor::<Message>::default(),
+    );
+
+    serialized.send(message).await
+        .map_err(|err| BoxedError::new(err))
 }
