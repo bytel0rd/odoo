@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 odoo-core = { path = "../odoo-core" }
+odoo-net = { path = "../odoo-net" }
 dashmap = "5.5.3"
 xxhash-rust = {version = "0.8.7", features = ["xxh3", "const_xxh3"]}
 chrono = "0.4.31"
@@ -19,3 +20,4 @@ tokio-serde = {version = "0.8.0", features = ["serde", "cbor", "json", "serde_cb
 tokio-util = { version = "0.7.10", features = ["codec"] }
 futures = "0.3.29"
 uuid = { version = "1.6.1", features = ["v4"] }
+serde_cbor = "0.11.2"

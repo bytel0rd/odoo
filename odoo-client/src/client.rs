@@ -1,50 +1,42 @@
-use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt, TryStreamExt};
-use log::{debug, error, trace};
+use log::{error, trace};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::runtime::Handle;
 use tokio::sync;
-use tokio::sync::{broadcast, RwLock};
-use tokio_serde::formats::SymmetricalCbor;
-use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use uuid::Uuid;
 
 use odoo_core::encoder::{Message, MessageType};
 use odoo_core::helpers::BoxedError;
+use odoo_net::net_stream::{OdooNetErr, OdooNetStream, StreamBreaker};
 
 type ChannelMessage = (Message, Option<sync::mpsc::Sender<Message>>);
 
 pub struct OdooClient {
     host_url: String,
-    sender: sync::broadcast::Sender<ChannelMessage>,
-    reciver: sync::broadcast::Receiver<ChannelMessage>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum OdooClientError {
+    #[error("UnableToConnectToClient: {0}")]
     UnableToConnectToClient(String),
+
+    #[error("UnableToSendRequest: {0}")]
     UnableToSendRequest(String),
+
+    #[error("ServerError: {0}")]
     ServerError(String),
+
+    #[error("OdooClientError: {0:?}")]
     GeneralError(BoxedError),
 }
 
 impl OdooClient {
     pub fn new(host_url: String) -> Self {
-        let (tx, rx) = sync::broadcast::channel(5);
-        let tx2 = tx.clone();
-        let host_url_async = host_url.clone();
-        tokio::spawn(async move {
-            OdooClient::write_channel(host_url_async.as_str(), tx2).await.expect("Failed connection to odoo server");
-        });
-
         OdooClient {
             host_url,
-            sender: tx,
-            reciver: rx,
         }
     }
 
@@ -62,15 +54,26 @@ impl OdooClient {
             id: Some(Uuid::new_v4()),
         };
 
-        self.sender.send((message, None))
+        let client = OdooNetStream::connect(self.host_url.as_str(), StreamBreaker::zero_delimiter())
+            .await
             .map_err(|err| OdooClientError::GeneralError(BoxedError::new(err)))?;
+
+        match serde_cbor::to_vec(&message) {
+            Ok(data) => {
+                client.write(data.as_slice()).await
+                    .map_err(|err| OdooClientError::GeneralError(BoxedError::new(err)))?;
+            }
+            Err(err) => {
+                return Err(OdooClientError::UnableToSendRequest(format!("Failed to deserialize: {}", err.to_string())));
+            }
+        }
 
         Ok(())
     }
 
 
     pub async fn get_key(&self, key: &str) -> Result<Option<Vec<u8>>, OdooClientError> {
-        let (tx, mut rx) = sync::mpsc::channel(1);
+        let (tx, mut rx) = sync::mpsc::channel(5);
 
         let mut cmds = vec![];
         cmds.push("GET".as_bytes().to_vec());
@@ -82,8 +85,62 @@ impl OdooClient {
             id: Some(Uuid::new_v4()),
         };
 
-        self.sender.send((message, Some(tx)))
+        let client = OdooNetStream::connect(self.host_url.as_str(), StreamBreaker::zero_delimiter())
+            .await
             .map_err(|err| OdooClientError::GeneralError(BoxedError::new(err)))?;
+
+        match serde_cbor::to_vec(&message) {
+            Ok(data) => {
+                client.write(data.as_slice()).await
+                    .map_err(|err| OdooClientError::GeneralError(BoxedError::new(err)))?;
+            }
+            Err(err) => {
+                return Err(OdooClientError::UnableToSendRequest(format!("Failed to deserialize: {}", err.to_string())));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let message_id = message.id.clone();
+        let tx_1 = tx.clone();
+        tokio::spawn(async move {
+            let tx_2 = tx_1.clone();
+            let result = client.read(move |bytes| {
+                match serde_cbor::from_slice(bytes) {
+                    Ok(data) => {
+                        let tx_1 = tx_1.clone();
+                        Handle::current().spawn(async move {
+                            if let Err(_) = tx_1.send(data).await {
+                                trace!("Failed to send net stream data to receiver");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        let error_message = OdooClient::create_error_message(
+                            format!("Failed to deserialize: {}", err.to_string()).as_str(),
+                            message_id);
+                        let tx_1 = tx_1.clone();
+                        Handle::current().spawn(async move {
+                            if let Err(_) = tx_1.send(error_message).await {
+                                trace!("Failed to error to receiver channel");
+                            }
+                        });
+                    }
+                }
+                return false;
+            }).await;
+            if let Err(err) = result {
+                let error_message = OdooClient::create_error_message(
+                    format!("Failed to read from stream: {}", err.to_string()).as_str(),
+                    message_id);
+
+                Handle::current().spawn(async move {
+                    if let Err(_) = tx_2.send(error_message).await {
+                        trace!("Failed to send error to receiver channel");
+                    }
+                });
+            }
+        });
+
 
         while let Some(message) = rx.recv().await {
             let raw_data = message.data.get(0).map(|v| v.to_owned());
@@ -104,28 +161,44 @@ impl OdooClient {
         return Ok(None);
     }
 
-    pub async fn append_to_stream(&self, key: &str, value: &[u8], timeout_in_mills_secs: Option<i64>) -> Result<(), OdooClientError> {
-        let mut cmds = vec![];
-        cmds.push("APPEND".as_bytes().to_vec());
-        cmds.push(key.as_bytes().to_vec());
-        cmds.push(value.to_vec());
-        let timeout = timeout_in_mills_secs.unwrap_or(-1i64).to_string();
-        cmds.push(timeout.as_bytes().to_vec());
-        let message = Message {
-            r#type: MessageType::REQUEST,
-            data: cmds,
-            timestamp: Some(chrono::Utc::now().timestamp()),
-            id: Some(Uuid::new_v4()),
-        };
+    pub async fn append_to_stream(&self, key: &str, mut rx: sync::mpsc::UnboundedReceiver<Vec<u8>>, timeout_in_mills_secs: Option<i64>) -> Result<(), OdooClientError> {
+        let client = OdooNetStream::connect(self.host_url.as_str(), StreamBreaker::zero_delimiter())
+            .await
+            .map_err(|err| OdooClientError::GeneralError(BoxedError::new(err)))?;
 
-        self.sender.send((message, None))
+        while let Some(data) = rx.recv().await {
+            let mut cmds = vec![];
+            cmds.push("APPEND".as_bytes().to_vec());
+            cmds.push(key.as_bytes().to_vec());
+            cmds.push(data);
+            let timeout = timeout_in_mills_secs.unwrap_or(-1i64).to_string();
+            cmds.push(timeout.as_bytes().to_vec());
+            let message = Message {
+                r#type: MessageType::REQUEST,
+                data: cmds,
+                timestamp: Some(chrono::Utc::now().timestamp()),
+                id: Some(Uuid::new_v4()),
+            };
+            match serde_cbor::to_vec(&message) {
+                Ok(data) => {
+                    client.write(data.as_slice()).await
+                        .map_err(|err| OdooClientError::UnableToSendRequest("Failed to send append stream message".to_string()))?;
+                }
+                Err(err) => {
+                    return Err(OdooClientError::UnableToSendRequest(format!("Failed to deserialize: {}", err.to_string())));
+                }
+            }
+        }
+
+
+        client.close_connection().await
             .map_err(|err| OdooClientError::GeneralError(BoxedError::new(err)))?;
 
         Ok(())
     }
 
-    pub async fn listen_to_stream<C>(&self, key: &str, checkpoint_time: Option<i64>, limit: Option<i64>, callback: C) -> Result<(), OdooClientError>
-        where C: Fn(Option<Vec<u8>>) -> () {
+    pub async fn listen_to_stream(&self, key: &str, checkpoint_time: Option<i64>, limit: Option<i64>, tx: sync::mpsc::Sender<Result<Vec<u8>, String>>) -> Result<(), OdooClientError>
+    {
 
         // RESUME {stream} {last_time?} {limit?} {replay?}
         let mut cmds = vec![];
@@ -143,133 +216,99 @@ impl OdooClient {
             id: Some(Uuid::new_v4()),
         };
 
-        let mut socket = OdooClient::open_tcp_stream(self.host_url.as_str()).await?;
-        let (mut r, mut w) = tokio::io::split(socket);
-        let length_delimited = FramedWrite::new(w, LengthDelimitedCodec::new());
-        let mut serialized = tokio_serde::SymmetricallyFramed::new(
-            length_delimited,
-            SymmetricalCbor::<Message>::default(),
-        );
-        if let Err(err) = serialized.send(message).await {
-            error!("Error sending message to network stream: {:?}", &err);
-        }
+        let client = OdooNetStream::connect(self.host_url.as_str(), StreamBreaker::zero_delimiter())
+            .await
+            .map_err(|err| OdooClientError::GeneralError(BoxedError::new(err)))?;
 
-        let length_delimited = FramedRead::new(r, LengthDelimitedCodec::new());
-        let mut deserialized = tokio_serde::SymmetricallyFramed::new(
-            length_delimited,
-            SymmetricalCbor::<Message>::default(),
-        );
-
-        loop {
-            match deserialized.next().await {
-                None => {
-                    trace!("received nothing");
-                    break;
-                }
-                Some(message) => {
-                    match message {
-                        Ok(response_message) => {
-                            debug!("Received value: {:?}",  &response_message);
-                            let data = response_message.data.get(0).map(|v| v.clone());
-                            callback(data);
-                        }
-                        Err(err) => {
-                            error!("Error serializing network stream: {:?}", &err);
-                            break;
-                        }
-                    };
-                }
+        match serde_cbor::to_vec(&message) {
+            Ok(data) => {
+                client.write(data.as_slice()).await
+                    .map_err(|err| OdooClientError::GeneralError(BoxedError::new(err)))?;
+            }
+            Err(err) => {
+                return Err(OdooClientError::UnableToSendRequest(format!("Failed to deserialize: {}", err.to_string())));
             }
         }
 
-        Ok(())
-    }
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
+        // loop {
+            let tx_1 = tx.clone();
 
-    async fn open_tcp_stream(host_url: &str) -> Result<TcpStream, OdooClientError> {
-        TcpStream::connect(host_url).await
-            .map_err(|e| {
-                let host_url = host_url.to_string();
-                error!("Unable to open tcp connection to: {} Ex: {:?}", &host_url, e);
-                OdooClientError::UnableToConnectToClient(host_url)
-            })
-    }
-
-    async fn write_channel(host_url: &str, mut tx: sync::broadcast::Sender<ChannelMessage>) -> Result<(), OdooClientError> {
-        let mut socket = OdooClient::open_tcp_stream(host_url).await?;
-        let (mut r, mut w) = tokio::io::split(socket);
-
-        let writer_task = tokio::spawn(OdooClient::handle_writer(w, tx.subscribe()));
-        let reader_task = tokio::spawn(OdooClient::handle_reader(r, tx.subscribe()));
-
-        tokio::try_join!(reader_task,  writer_task).unwrap();
-
-
-        Ok(())
-    }
-
-    async fn handle_writer(mut writer: tokio::io::WriteHalf<TcpStream>, mut rx: broadcast::Receiver<ChannelMessage>) {
-        let length_delimited = FramedWrite::new(writer, LengthDelimitedCodec::new());
-        let mut serialized = tokio_serde::SymmetricallyFramed::new(
-            length_delimited,
-            SymmetricalCbor::<Message>::default(),
-        );
-
-        println!("3: listening to writing for server");
-        loop {
-            println!("3-1: going to pick things to write");
-            match rx.recv().await {
-                Ok((message, _)) => {
-                    debug!("sending message-ID: {:?}", &message.id);
-                    if let Err(err) = serialized.send(message).await {
-                        error!("Error sending message to network stream: {:?}", &err);
+            let result = client.read(move |bytes| {
+                match serde_cbor::from_slice::<Message>(bytes) {
+                    Ok(message) => {
+                        let tx_1 = tx_1.clone();
+                        Handle::current().spawn(async move {
+                            let raw_data = message.data.get(0).map(|v| v.to_owned());
+                            match message.r#type {
+                                MessageType::STREAM => {
+                                    if let Some(data) = raw_data {
+                                        if let Err(_) = tx_1.send(Ok(data)).await {
+                                            trace!("Failed to send net stream data to receiver");
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    if let Some(bytes) = raw_data {
+                                        match String::from_utf8(bytes) {
+                                            Ok(error_message) => {
+                                                if let Err(_) = tx_1.send(Err(error_message)).await {
+                                                    trace!("Failed to send net stream error to receiver");
+                                                }
+                                            }
+                                            Err(error) => {
+                                                if let Err(_) = tx_1.send(Err("Unable to parse error bytes".to_string())).await {
+                                                    trace!("Failed to send net stream error to receiver");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                        });
+                    }
+                    Err(err) => {
+                        let error_message = format!("Failed to deserialize: {}", err.to_string());
+                        let tx_1 = tx_1.clone();
+                        Handle::current().spawn(async move {
+                            if let Err(_) = tx_1.send(Err(error_message)).await {
+                                trace!("Failed to error to receiver channel");
+                            }
+                        });
                     }
                 }
-                Err(err) => {
-                    error!("Error receiving req messages: {:?}", &err);
+                return false;
+            }).await;
+        match result {
+            Ok(status) => {
+                trace!("Read progressing: {}", status);
+                if status {
+                    //break
                 }
+            }
+            Err(err) => {
+                let error_message = format!("Failed to read from stream: {}", err.to_string());
+                Handle::current().spawn(async move {
+                    if let Err(_) = tx.send(Err(error_message)).await {
+                        trace!("Failed to send error to receiver channel");
+                    }
+                });
+                // break;
+
             }
         }
+
+
+        return Ok(());
     }
 
-    async fn handle_reader(mut reader: tokio::io::ReadHalf<TcpStream>, mut rx: broadcast::Receiver<ChannelMessage>) {
-        let length_delimited = FramedRead::new(reader, LengthDelimitedCodec::new());
-        let mut deserialized = tokio_serde::SymmetricallyFramed::new(
-            length_delimited,
-            SymmetricalCbor::<Message>::default(),
-        );
-
-        let reciever_map = Arc::new(RwLock::new(BTreeMap::new()));
-        let reciever_async = reciever_map.clone();
-        tokio::spawn(async move {
-            while let Ok((message, some_receiver)) = rx.recv().await {
-                if let Some(reply_channel) = some_receiver {
-                    let mut channels = reciever_async.write().await;
-                    channels.insert(message.id, reply_channel);
-                }
-            }
-        });
-
-        println!("5: waiting to receive");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        while let Some(message) = deserialized.next().await {
-            match message {
-                Ok(response_message) => {
-                    debug!("Received value: {:?}",  &response_message);
-                    let mut map = reciever_map.write().await;
-                    let id = response_message.id.clone();
-                    if let Some(receiver) = map.get(&id) {
-                        if let Err(err) = receiver.send(response_message).await {
-                            error!("Error sending message to receiver stream: {:?}", &err);
-                            map.remove(&id);
-                        }
-                    }
-                }
-                Err(err) => {
-                    error!("Error serializing network stream: {:?}", &err);
-                }
-            };
+    fn create_error_message(message: &str, id: Option<uuid::Uuid>) -> Message {
+        Message {
+            r#type: MessageType::ERROR,
+            data: vec![message.as_bytes().to_vec()],
+            timestamp: Some(chrono::Utc::now().timestamp()),
+            id,
         }
     }
 }

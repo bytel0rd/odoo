@@ -13,7 +13,7 @@ use crate::parser::Command;
 pub async fn execute(store: &KeyStore,
                      listener_hub: Arc<ListenerHub>,
                      request_id: Option<Uuid>,
-                     cmd: Command, channel: sync::mpsc::UnboundedSender<Message>) -> Result<(), ListenerHubError> {
+                     cmd: Command, channel: sync::mpsc::Sender<Message>) -> Result<(), ListenerHubError> {
     match &cmd {
         Command::SET(key, value) => {
             store.add_key(key.as_str(), value.value.to_vec(), value.duration)
@@ -26,7 +26,7 @@ pub async fn execute(store: &KeyStore,
                 timestamp: Some(chrono::Utc::now().timestamp()),
                 id: request_id,
             };
-            channel.send(result)
+            channel.send(result).await
                 .map_err(|err| {
                     error!("Unable to send reply for get key: {} Error: {:?}", key.as_str(), err);
                     ListenerHubError::ReplyFailedError
@@ -79,7 +79,7 @@ pub async fn execute(store: &KeyStore,
                         timestamp: Some(chrono::Utc::now().timestamp()),
                         id: request_id,
                     };
-                    channel.send(message)
+                    channel.send(message).await
                         .map_err(|err| {
                             error!("Unable to send reply for stream key: {} Error: {:?}", stream_key.as_str(), err);
                             ListenerHubError::ReplyFailedError
@@ -102,7 +102,7 @@ pub async fn execute(store: &KeyStore,
                             id: request_id,
                         };
                         debug!("sending update stream: {}", stream_key.as_str());
-                        channel.send(message)
+                        channel.send(message).await
                             .map_err(|err| {
                                 error!("Unable to send reply for stream key: {} Error: {:?}", stream_key.as_str(), err);
                                 ListenerHubError::ReplyFailedError

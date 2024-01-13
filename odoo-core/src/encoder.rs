@@ -33,6 +33,12 @@ pub struct Message {
     pub id: Option<uuid::Uuid>
 }
 
+impl Message {
+    pub fn get_message_id(&self) -> String {
+        self.id.map(|v| v.to_string()).unwrap_or_default()
+    }
+}
+
 impl MessageEncoder {
     pub fn new() -> Result<Self, EncoderError> {
         Ok(MessageEncoder)

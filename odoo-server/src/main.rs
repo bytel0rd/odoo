@@ -17,7 +17,7 @@ mod server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    std::env::set_var("RUST_LOG", "INFO");
+    // std::env::set_var("RUST_LOG", "INFO");
     pretty_env_logger::init();
 
     let keystore = Arc::new(KeyStore::new());

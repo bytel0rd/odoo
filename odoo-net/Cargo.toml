@@ -1,0 +1,21 @@
+[package]
+name = "odoo-net"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+chrono = "0.4.31"
+log = { version = "0.4.20", features = [] }
+uuid = {version = "1.6.1", features = ["default", "v7", "serde"]}
+tokio = { version = "1.35.0", features = ["default", "rt", "sync", "fs", "time", "io-util", "test-util", "macros", "full"] }
+serde = {version = "1.0.193", features = ["default", "derive"]}
+serde_cbor = "0.10"
+thiserror = "1.0.51"
+tokio-serde = {version = "0.8.0", features = ["serde", "cbor", "json", "serde_cbor", "serde_json"]}
+tokio-util = { version = "0.7.10", features = ["codec", "io", "net"] }
+futures = "0.3.29"
+async-recursion = "1.0.5"
+bytes = "1.5.0"
+pretty_env_logger = "0.5.0"

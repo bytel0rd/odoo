@@ -49,6 +49,16 @@ impl Command {
             Command::RESUME(key, _) => hash_key_to_unsigned_int(key.as_bytes())
         };
     }
+
+    pub fn to_string(&self) -> String {
+        return match self {
+            Command::SET(key, _) => format!("{}__{}", "SET", self.get_event_key()),
+            Command::GET(key) => format!("{}__{}", "GET", self.get_event_key()),
+            Command::DELETE(key) => format!("{}__{}", "DELETE", self.get_event_key()),
+            Command::APPEND(key, _) => format!("{}__{}", "APPEND", self.get_event_key()),
+            Command::RESUME(key, _) => format!("{}__{}", "RESUME", self.get_event_key())
+        };
+    }
 }
 
 
