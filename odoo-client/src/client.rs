@@ -231,11 +231,13 @@ impl OdooClient {
         }
 
         tokio::time::sleep(Duration::from_millis(10)).await;
+        let tx_2 = tx.clone();
 
-        // loop {
+        loop {
             let tx_1 = tx.clone();
 
             let result = client.read(move |bytes| {
+                let tx_1 = tx_1.clone();
                 match serde_cbor::from_slice::<Message>(bytes) {
                     Ok(message) => {
                         let tx_1 = tx_1.clone();
@@ -280,23 +282,24 @@ impl OdooClient {
                 }
                 return false;
             }).await;
-        match result {
-            Ok(status) => {
-                trace!("Read progressing: {}", status);
-                if status {
-                    //break
-                }
-            }
-            Err(err) => {
-                let error_message = format!("Failed to read from stream: {}", err.to_string());
-                Handle::current().spawn(async move {
-                    if let Err(_) = tx.send(Err(error_message)).await {
-                        trace!("Failed to send error to receiver channel");
-                    }
-                });
-                // break;
-
-            }
+            // match result {
+            //     Ok(status) => {
+            //         trace!("Read progressing: {}", status);
+            //         if status {
+            //             //break
+            //         }
+            //     }
+            //     Err(err) => {
+            //         let error_message = format!("Failed to read from stream: {}", err.to_string());
+            //         let tx_1 = tx_1.clone();
+            //         Handle::current().spawn(async move {
+            //             if let Err(_) = tx_1.send(Err(error_message)).await {
+            //                 trace!("Failed to send error to receiver channel");
+            //             }
+            //         });
+            //         // break;
+            //     }
+            // }
         }
 
 

@@ -108,6 +108,7 @@ impl OdooServer {
                 handle.spawn(async move {
                     if let Err(_) = stream.write(data.as_slice()).await {
                         error!("Failed to write send reply");
+                        stream.close_connection()
                     }
                 });
             }
